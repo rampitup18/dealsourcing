@@ -1,0 +1,181 @@
+// Deal Sourcing Agent — data model
+//
+// Design intent: the entity that matters most is the PROPONENT (the developer),
+// because "previous deals by the parties" = every Project this Proponent has
+// ever touched across the public datasets. Projects roll up to a Proponent, so
+// a proponent's track record falls out of the schema for free — no extra source.
+//
+// A LEAD is a Project that has cleared qualification. We keep Project and Lead
+// distinct so we can ingest everything but only surface what fits the mandate.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Proponent: the developer / applicant. The hub of the graph.
+// ---------------------------------------------------------------------------
+model Proponent {
+  id        String   @id @default(cuid())
+  name      String   @unique // normalized name used to dedupe across sources
+  rawNames  String[] // every spelling seen in the wild (AEMO vs EPBC differ)
+
+  // ABR / ASIC enrichment (free gov data)
+  abn          String?
+  entityType   String?
+  entityStatus String?
+  registeredAt String? // state/territory of registration
+  directors    Json? // [{ name, role }] from ASIC where available
+
+  website      String?
+  linkedinUrl  String? // best-guess company page (search URL until verified)
+
+  projects  Project[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([abn])
+}
+
+// ---------------------------------------------------------------------------
+// Project: one development, sourced from AEMO and/or EPBC. Deduped by a
+// fingerprint so the same project from both feeds collapses into one row.
+// ---------------------------------------------------------------------------
+model Project {
+  id          String  @id @default(cuid())
+  fingerprint String  @unique // hash(name + region + tech) for cross-source dedupe
+
+  name        String
+  technology  Technology
+  capacityMw  Float?
+  region      Region? // NEM region
+  state       String?
+
+  // Lifecycle stage as reported by the source. The qualifier cares a lot
+  // about this — pre-FID / proposed is the sweet spot; operating is noise.
+  stage       Stage
+
+  // Spatial (from EPBC polygons or AEMO where available)
+  latitude    Float?
+  longitude   Float?
+  // Straight-line km to nearest transmission — computed at ingest if a grid
+  // layer is configured; null otherwise. A strong proxy for connection cost.
+  kmToTransmission Float?
+
+  proponent   Proponent @relation(fields: [proponentId], references: [id])
+  proponentId String
+
+  sources     ProjectSource[]
+  lead        Lead?
+
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  @@index([proponentId])
+  @@index([stage])
+  @@index([technology])
+}
+
+// Provenance: which feed(s) a project came from, with the raw payload kept
+// for audit. You will thank yourself for storing the raw row.
+model ProjectSource {
+  id         String   @id @default(cuid())
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId  String
+  source     Source
+  sourceRef  String? // AEMO duid / EPBC referral number
+  sourceUrl  String?
+  raw        Json // the untouched record from the feed
+  seenAt     DateTime @default(now())
+
+  @@unique([projectId, source])
+}
+
+// ---------------------------------------------------------------------------
+// Lead: a Project that passed qualification, plus the LLM's reasoning, the
+// drafted outreach, and the human workflow state.
+// ---------------------------------------------------------------------------
+model Lead {
+  id        String @id @default(cuid())
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String  @unique
+
+  // Qualification output (LLM)
+  fitScore   Int // 0-100, weighted blend of the sub-scores below
+  stageFit   Int // 0-100
+  scaleFit   Int // 0-100
+  techFit    Int // 0-100
+  capitalNeedFit Int // 0-100 — does this proponent plausibly need pre-FID capital
+  rationale  String  @db.Text // one-paragraph "why this scored what it did"
+  flags      String[] // e.g. "already capitalized", "major utility", "data gap"
+
+  // Drafted outreach (LLM). Kept editable; status tracks human review.
+  emailSubject String? @db.Text
+  emailBody    String? @db.Text
+  emailStatus  EmailStatus @default(DRAFT)
+
+  // Workflow
+  status     LeadStatus @default(NEW)
+  notes      String? @db.Text
+
+  qualifiedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([fitScore])
+  @@index([status])
+}
+
+enum Technology {
+  SOLAR
+  WIND
+  BATTERY
+  SOLAR_BATTERY
+  PUMPED_HYDRO
+  HYBRID
+  GREEN_HYDROGEN
+  TRANSMISSION
+  OTHER
+}
+
+enum Region {
+  NSW1
+  QLD1
+  SA1
+  TAS1
+  VIC1
+}
+
+enum Stage {
+  ENQUIRY // connection enquiry lodged — earliest signal
+  PROPOSED // announced / committed-but-pre-FID
+  COMMITTED // committed per AEMO, FID likely reached
+  OPERATING // built — noise for our purposes
+  WITHDRAWN
+  UNKNOWN
+}
+
+enum Source {
+  AEMO
+  EPBC
+  MANUAL
+}
+
+enum LeadStatus {
+  NEW
+  REVIEWING
+  CONTACTED
+  IN_DISCUSSION
+  PASSED // we declined
+  ARCHIVED
+}
+
+enum EmailStatus {
+  DRAFT
+  APPROVED
+  SENT
+}
